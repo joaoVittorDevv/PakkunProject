@@ -25,33 +25,23 @@ def set_theme():
         /* ... (mantido igual) ... */
         </style>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
 def carrega_modelo(folder_path):
-
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDINGS_MODEL,
         model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-        encode_kwargs={"normalize_embeddings": True}
+        encode_kwargs={"normalize_embeddings": True},
     )
 
-    vectorstore = PineconeVectorStore(
-        index_name=INDEX_NAME,
-        embedding=embeddings
-    )
-
+    vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
 
     metadata_filter = {}
 
-
     retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={
-            "k": 5,
-            "filter": metadata_filter
-        }
+        search_type="similarity", search_kwargs={"k": 5, "filter": metadata_filter}
     )
 
     system_message = """Você é Pakkun, especialista em código. Use APENAS estes contextos:
@@ -63,18 +53,26 @@ Regras de resposta:
 2. Referencie metadados (ex: `source: path/arquivo.py`)
 3. Seja técnico e detalhista"""
 
-    template = ChatPromptTemplate.from_messages([
-        ("system", system_message),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-
+    template = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_message),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
 
     chain = (
-        RunnableLambda(lambda x: {**x, "context": "\n\n".join(
-            [f"{doc.metadata.get('source', 'Unknown')}:\n{doc.page_content[:300]}"
-             for doc in retriever.get_relevant_documents(x["input"])]
-        )})
+        RunnableLambda(
+            lambda x: {
+                **x,
+                "context": "\n\n".join(
+                    [
+                        f"{doc.metadata.get('source', 'Unknown')}:\n{doc.page_content[:300]}"
+                        for doc in retriever.get_relevant_documents(x["input"])
+                    ]
+                ),
+            }
+        )
         | template
         | ChatGroq(model_name="deepseek-r1-distill-llama-70b")
     )
@@ -83,9 +81,22 @@ Regras de resposta:
 
 
 tracer = LangChainTracer(
-    project_name="PakkunMonitor",
-    tags=["production", "code-analysis"]
+    project_name="PakkunMonitor", tags=["production", "code-analysis"]
 )
+
+
+def split_thought_and_response(text):
+
+    if not isinstance(text, str):
+        text = getattr(text, "content", str(text))
+    pattern = r"<think>(.*?)</think>(.*)"
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        internal_thought = match.group(1).strip()
+        final_response = match.group(2).strip()
+        return internal_thought, final_response
+    else:
+        return "", text.strip()
 
 
 def chat():
@@ -102,26 +113,39 @@ def chat():
 
     if input_user := st.chat_input("Fala comigo!"):
         arquivos_relevantes = extrair_metadados(input_user)
-
-        adjusted_filter = {"source": {"$in": arquivos_relevantes}} if arquivos_relevantes else {}
-
-        st.chat_message("human").markdown(input_user)
-        chat_msg = st.chat_message("ai")
-
-        resposta = chat_msg.write_stream(
-            st.session_state["chain"].stream(
-                {"input": input_user, "chat_history": memoria.buffer_as_messages},
-                config={"callbacks": [tracer]}
-            )
+        adjusted_filter = (
+            {"source": {"$in": arquivos_relevantes}} if arquivos_relevantes else {}
         )
 
+        st.chat_message("human").markdown(input_user)
+
+        with st.spinner("Carregando resposta..."):
+            resposta = st.session_state["chain"].invoke(
+                {"input": input_user, "chat_history": memoria.buffer_as_messages},
+                config={"callbacks": [tracer]},
+            )
+
+        internal_thought, final_response = split_thought_and_response(resposta)
+
+        combined_message = ""
+        if internal_thought:
+            combined_message += (
+                f"<details>\n"
+                f"<summary>Pensamento interno (minimizado)</summary>\n\n"
+                f"{internal_thought}\n"
+                f"</details>\n\n"
+            )
+        combined_message += final_response
+
+        st.chat_message("ai").markdown(combined_message, unsafe_allow_html=True)
+
         memoria.chat_memory.add_user_message(input_user)
-        memoria.chat_memory.add_ai_message(resposta)
+        memoria.chat_memory.add_ai_message(final_response)
         st.session_state["memoria"] = memoria
 
 
 def extrair_metadados(input_text):
-    padrao_arquivos = r'\b[\w\-_]+\.(py|js|ts|md|txt)\b'
+    padrao_arquivos = r"\b[\w\-_]+\.(py|js|ts|md|txt)\b"
     matches = re.findall(padrao_arquivos, input_text)
     base_dir = st.session_state.get("folder_path", "")
     arquivos_relevantes = []
@@ -147,36 +171,21 @@ def list_all_subdirectories(base_dir):
     return subfolders
 
 
-def sidebar():
-    st.sidebar.header("Configurações do Pakkun")
-    base_dir = st.sidebar.text_input("Informe o caminho base", value="..")
-    try:
-        folder_list = list_all_subdirectories(base_dir)
-    except Exception as e:
-        st.sidebar.error(f"Erro ao listar pastas: {e}")
-        folder_list = []
-
-    if folder_list:
-        selected_folder = st.sidebar.selectbox(
-            "Selecione a pasta desejada",
-            folder_list,
-            format_func=lambda x: os.path.basename(x) if os.path.basename(x) else x
-        )
-    else:
-        selected_folder = None
-
-    if st.sidebar.button("Chamar o Pakkun", use_container_width=True):
-        if selected_folder:
-            st.session_state["folder_path"] = selected_folder
-            carrega_modelo(selected_folder)
-        else:
-            st.sidebar.error("Por favor, selecione uma pasta.")
-
-
 def main():
     set_theme()
-    with st.sidebar:
-        sidebar()
+
+    default_base_dir = ".."
+    try:
+        folder_list = list_all_subdirectories(default_base_dir)
+        selected_folder = folder_list[0] if folder_list else default_base_dir
+    except Exception as e:
+        st.error(f"Erro ao listar pastas: {e}")
+        st.stop()
+
+    st.session_state["folder_path"] = selected_folder
+    carrega_modelo(selected_folder)
+    st.success("Modelo conectado com a base e pronto!")
+
     chat()
 
 
