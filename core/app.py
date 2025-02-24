@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from langchain.callbacks import LangChainTracer
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.runnables import RunnableLambda
 from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore
@@ -130,8 +130,8 @@ def chat():
         combined_message = ""
         if internal_thought:
             combined_message += (
-                f"<details>\n"
-                f"<summary>Pensamento interno (minimizado)</summary>\n\n"
+                f"<details style='color: grey; font-size: medium;'>\n"
+                f"<summary style='font-size: medium;'>Raciocínio</summary>\n\n"
                 f"{internal_thought}\n"
                 f"</details>\n\n"
             )
@@ -140,7 +140,6 @@ def chat():
         st.chat_message("ai").markdown(combined_message, unsafe_allow_html=True)
 
         memoria.chat_memory.add_user_message(input_user)
-        memoria.chat_memory.add_ai_message(final_response)
         st.session_state["memoria"] = memoria
 
 
