@@ -1,106 +1,123 @@
-# Pakkun Project
+# 🐕 Pakkun Project - Assistente de Código com RAG
 
-Este projeto consiste em um sistema de indexação de código e uma interface de chat que utiliza os dados indexados para fornecer respostas baseadas em similaridade de embeddings. O projeto utiliza o **Pinecone** como banco de dados vetorial e **Streamlit** para a interface interativa.
+Pakkun é um assistente inteligente de código que utiliza técnicas avançadas de RAG (Retrieval Augmented Generation) para fornecer respostas precisas sobre sua base de código. O projeto utiliza **ChromaDB** como banco de dados vetorial local e **Streamlit** para a interface interativa.
 
----
+## 📊 Funcionalidades
 
-## 📌 Pré-requisitos
+- **Indexação Inteligente**: Análise e indexação de códigos com extração de estruturas específicas como funções, classes e componentes
+- **Busca Semântica**: Recuperação de informações baseada em significado usando embeddings, não apenas correspondência de palavras-chave
+- **Múltiplas Estratégias de Recuperação**: Combina diferentes métodos para encontrar o conteúdo mais relevante
+- **Interface Intuitiva**: Interface de chat amigável para interagir com o assistente
 
-Certifique-se de ter os seguintes requisitos antes de iniciar:
+## 📋 Pré-requisitos
 
 - **Python** 3.8+
-- **Conta e chave de API** do Pinecone
 - **Streamlit** (https://streamlit.io/)
+- **ChromaDB** para armazenamento de vetores
 - **Bibliotecas listadas em** `requirements.txt`
-
----
+- **Chave API para o Groq** (ou outro LLM compatível)
 
 ## 🚀 Instalação
 
-### 1️⃣ Clonar o repositório e acessar a pasta do projeto:
+### 1️⃣ Clonar o repositório:
 ```sh
-# Clone o repositório
 git clone <URL_DO_REPOSITÓRIO>
-
-# Entre no diretório do projeto
 cd <NOME_DO_PROJETO>
 ```
 
-### 2️⃣ Criar e ativar um ambiente virtual (opcional, mas recomendado):
+### 2️⃣ Configurar ambiente virtual:
 ```sh
-# Criar um ambiente virtual
 python -m venv venv
 
-# Ativar o ambiente virtual (Linux/Mac)
+# Linux/Mac
 source venv/bin/activate
 
-# No Windows
+# Windows
 venv\Scripts\activate
 ```
 
-### 3️⃣ Instalar as dependências:
+### 3️⃣ Instalar dependências:
 ```sh
 pip install -r requirements.txt
 ```
 
-### 4️⃣ Configurar as variáveis de ambiente:
-Crie um arquivo `.env` na raiz do projeto e defina as variáveis necessárias, por exemplo:
+### 4️⃣ Configurar variáveis de ambiente:
+Crie um arquivo `.env` na raiz do projeto:
 ```ini
-PINECONE_API_KEY=your_pinecone_api_key_here
-PINECONE_CLOUD=aws
-PINECONE_REGION=us-east-1
-# Outras variáveis necessárias...
+GROQ_API_KEY=your_groq_api_key_here
+# Outras variáveis se necessário
 ```
-
----
 
 ## 🔍 Indexação dos Dados
 
-Antes de rodar o app, é necessário indexar os arquivos de código.
+Antes de usar o assistente, é necessário indexar sua base de código:
 
-### 📌 Passo 1: Executar o script de indexação
-Utilize o comando abaixo, substituindo `<caminho da pasta>` pelo diretório contendo os arquivos que deseja indexar:
 ```sh
-python core/code_indexer.py --folder <caminho da pasta>
+python core/code_indexer.py --folder <caminho_da_pasta>
 ```
 
-🔹 Esse comando irá:
-- Ler os arquivos de código no diretório especificado;
-- Gerar os embeddings dos documentos utilizando o modelo configurado;
-- Indexar os dados no Pinecone.
+Este processo:
+- Lê todos os arquivos de código no diretório especificado
+- Extrai estruturas importantes como classes e funções
+- Divide os documentos em chunks para busca semântica
+- Gera embeddings usando o modelo sentence-transformers
+- Armazena tudo no banco ChromaDB local
 
----
+## 🤖 Executando o Assistente
 
-## 🎯 Executando o Projeto
-
-Após a indexação dos dados, inicie a interface do chat com o comando:
+Após a indexação, execute:
 ```sh
 streamlit run core/app.py
 ```
-O Streamlit abrirá uma nova janela ou aba no navegador com a interface do Pakkun, permitindo interações e consultas baseadas nos dados indexados.
 
----
+Seu navegador abrirá automaticamente com a interface do Pakkun, onde você pode:
+- Fazer perguntas sobre sua base de código
+- Mencionar arquivos específicos para obter informações detalhadas
+- Ver explicações técnicas com formatação adequada
+- Acompanhar o raciocínio detalhado do assistente (opcional)
+
+## 🧠 Recursos Avançados
+
+- **Deduplicação e Reranking**: Algoritmos que priorizam e diversificam resultados
+- **Extração Inteligente**: Analisa diferentes linguagens de programação e extrai estruturas específicas
+- **Memória de Conversa**: Mantém o contexto da conversa para respostas mais precisas
+- **Filtros Contextuais**: Busca otimizada baseada no tipo de pergunta
+
+## 🔧 Personalização
+
+Você pode personalizar vários aspectos do sistema:
+- Modelos de embedding no arquivo `code_indexer.py`
+- Modelo LLM usado para respostas em `app.py`
+- Parâmetros de busca e contexto no `RAGAssistant`
+- Aparência da interface através das configurações de tema
 
 ## 📂 Estrutura do Projeto
 
 ```
 .
-├── core
-│   ├── code_indexer.py   # Script para indexação dos dados de código
-│   └── app.py            # Aplicação Streamlit (interface do chat)
+├── core/
+│   ├── code_indexer.py   # Sistema de indexação avançado
+│   └── app.py            # Interface Streamlit e sistema RAG
+├── chroma_db/            # Banco de dados vetorial local (gerado)
 ├── requirements.txt      # Dependências do projeto
 ├── .env                  # Variáveis de ambiente (não commitado)
 └── README.md             # Este arquivo
 ```
 
----
+## 🤝 Contribuições
 
-## 🔧 Personalização e Contribuições
+Contribuições são bem-vindas! Se você tiver sugestões para melhorar o sistema:
+1. Faça um fork do projeto
+2. Crie uma branch para sua funcionalidade (`git checkout -b feature/nova-funcionalidade`)
+3. Commit suas alterações (`git commit -m 'Adiciona nova funcionalidade'`)
+4. Push para a branch (`git push origin feature/nova-funcionalidade`)
+5. Abra um Pull Request
 
-### 🔄 Refino do Código
-Este projeto está em fase de desenvolvimento. Caso tenha sugestões ou melhorias, fique à vontade para contribuir ou abrir uma issue no repositório.
+## 📝 Licença
 
-### ⚙️ Customização
-Se desejar modificar a indexação, modelo de embeddings ou interface, você pode ajustar os parâmetros conforme sua necessidade nos scripts do diretório `core`.
+Distribuído sob a licença MIT. Veja `LICENSE` para mais informações.
 
+## 📞 Contato
+
+Para questões e sugestões, por favor abra uma issue no repositório.
 

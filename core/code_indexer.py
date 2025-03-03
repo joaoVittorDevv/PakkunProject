@@ -1,206 +1,462 @@
 import argparse
-import json
 import logging
 import os
-import time
+import re
+from typing import List, Dict, Optional, Tuple
 
 import chardet
 import torch
-from decouple import config
-from dotenv import load_dotenv
-from langchain.retrievers import ParentDocumentRetriever
 from langchain.schema import Document
-from langchain.storage import LocalFileStore
-from langchain.storage._lc_store import create_kv_docstore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_pinecone import PineconeVectorStore
-from pinecone import Pinecone, ServerlessSpec
+from langchain_chroma import Chroma
 from tqdm import tqdm
 
-load_dotenv()
-
-
+# Configurações
 EMBEDDINGS_MODEL = "sentence-transformers/all-mpnet-base-v2"
-MODEL_DIMENSION = 768
-PERSIST_DIR = "./pinecone_db"
-INDEX_NAME = "codebase-index"
-ALLOWED_EXTS = {'.py', '.js', '.ts', '.md', '.json', '.yml', '.yaml',
-                '.txt', '.sh', '.dockerfile', '.html', '.css', '.vue'}
-EXCLUDED_DIRS = {'node_modules', 'venv', '__pycache__', '.git', '.idea', 'env', 'dist', 'build'}
-MAX_FILE_SIZE = 50_000_000  # 50 MB
-MAX_TOKENS_PER_BATCH = 500000
-MAX_METADATA_SIZE = 40000  # 40KB com margem de segurança
+PERSIST_DIR = "./chroma_db"
+COLLECTION_NAME = "code_collection"
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 150
 
-# Configuração do logger
+ALLOWED_EXTS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".md", ".json", ".yml", ".yaml", 
+    ".txt", ".sh", ".dockerfile", ".html", ".css", ".vue", ".java", ".c", 
+    ".cpp", ".h", ".cs", ".go", ".php", ".rb", ".rust", ".swift"
+}
+
+EXCLUDED_DIRS = {
+    "node_modules", "venv", ".venv", "__pycache__", ".git", ".idea", 
+    "env", "dist", "build", ".pytest_cache", "__snapshots__"
+}
+
+MAX_FILE_SIZE = 100_000_000  # 100 MB
+
+# Configuração de logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt='%H:%M:%S'
+    datefmt="%H:%M:%S",
 )
 
-def validate_metadata(metadata: dict) -> dict:
-    """Garante que os metadados estejam dentro dos limites do Pinecone."""
-    json_str = json.dumps(metadata, separators=(',', ':'))
-    while len(json_str.encode('utf-8')) > MAX_METADATA_SIZE:
-        if 'source' in metadata:
-            base_source = os.path.basename(metadata['source'])
+logger = logging.getLogger(__name__)
 
-            if base_source == metadata['source'] and len(base_source) > 200:
-                metadata['source'] = base_source[:200]
-            else:
-                metadata['source'] = base_source
-            json_str = json.dumps(metadata, separators=(',', ':'))
+
+class CodeIndexer:
+    """
+    Classe responsável por indexar código fonte e documentação.
+    Usa ChromaDB para armazenar embeddings de documentos completos e chunks de texto.
+    """
+    def __init__(
+        self,
+        embeddings_model: str = EMBEDDINGS_MODEL,
+        persist_dir: str = PERSIST_DIR,
+        collection_name: str = COLLECTION_NAME,
+        device: Optional[str] = None
+    ):
+        self.embeddings_model = embeddings_model
+        self.persist_dir = persist_dir
+        self.collection_name = collection_name
+        
+        # Determina o device para embeddings
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Utilizando device para embeddings: {self.device}")
+        
+        # Inicializa o modelo de embeddings
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=self.embeddings_model,
+            model_kwargs={"device": self.device},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+        
+        # Inicializa o text splitter para chunks
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " ", ""],
+            keep_separator=True,
+        )
+        
+        # Contadores para estatísticas
+        self.stats = {
+            "loaded": 0,
+            "skipped_ext": 0,
+            "skipped_size": 0,
+            "error": 0,
+            "total_chunks": 0,
+            "total_docs": 0,
+        }
+
+    def load_documents_from_folder(self, folder_path: str) -> List[Document]:
+        """
+        Carrega documentos de código do diretório especificado.
+        Retorna uma lista de documentos com metadados aprimorados.
+        """
+        logger.info(f"Carregando documentos do diretório: {folder_path}")
+        docs = []
+
+        for root, dirs, files in os.walk(folder_path):
+            # Filtra diretórios excluídos
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+            
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext not in ALLOWED_EXTS:
+                    self.stats["skipped_ext"] += 1
+                    continue
+
+                full_path = os.path.join(root, file)
+                try:
+                    # Verifica tamanho do arquivo
+                    if os.path.getsize(full_path) > MAX_FILE_SIZE:
+                        logger.warning(f"Arquivo grande ignorado: {full_path}")
+                        self.stats["skipped_size"] += 1
+                        continue
+
+                    # Lê o arquivo com detecção automática de encoding
+                    with open(full_path, "rb") as f:
+                        raw_data = f.read()
+                    
+                    result = chardet.detect(raw_data)
+                    encoding = result.get("encoding") or "utf-8"
+                    text = raw_data.decode(encoding, errors="replace").strip()
+                    
+                    if len(text) < 10:  # Ignora arquivos vazios ou muito pequenos
+                        self.stats["skipped_ext"] += 1
+                        continue
+
+                    # Caminho relativo para tornar os metadados mais legíveis
+                    rel_path = os.path.relpath(full_path, folder_path)
+                    logger.debug(f"Processando arquivo: {rel_path}")
+
+                    # Determina tipo de arquivo e linguagem
+                    file_type, language = self._get_file_metadata(ext)
+
+                    # Metadados aprimorados
+                    metadata = {
+                        "source": rel_path,
+                        "ext": ext[1:] if ext else "",
+                        "full_path": full_path,
+                        "file_size": len(text),
+                        "file_type": file_type,
+                        "language": language,
+                        "is_chunk": False,  # Documento completo
+                    }
+
+                    docs.append(Document(page_content=text, metadata=metadata))
+                    self.stats["loaded"] += 1
+
+                except Exception as e:
+                    logger.error(f"Erro ao carregar {full_path}: {str(e)}")
+                    self.stats["error"] += 1
+
+        logger.info(f"Documentos carregados: {self.stats['loaded']}")
+        logger.info(f"Documentos ignorados por extensão: {self.stats['skipped_ext']}")
+        logger.info(f"Arquivos muito grandes ignorados: {self.stats['skipped_size']}")
+        logger.info(f"Erros encontrados: {self.stats['error']}")
+        
+        return docs
+
+    def _get_file_metadata(self, ext: str) -> Tuple[str, str]:
+        """
+        Determina o tipo e linguagem de arquivo com base na extensão.
+        """
+        code_extensions = {
+            ".py": ("code", "python"),
+            ".js": ("code", "javascript"),
+            ".ts": ("code", "typescript"),
+            ".jsx": ("code", "react"),
+            ".tsx": ("code", "react-typescript"),
+            ".java": ("code", "java"),
+            ".c": ("code", "c"),
+            ".cpp": ("code", "cpp"),
+            ".cs": ("code", "csharp"),
+            ".go": ("code", "go"),
+            ".rb": ("code", "ruby"),
+            ".php": ("code", "php"),
+            ".html": ("code", "html"),
+            ".css": ("code", "css"),
+            ".vue": ("code", "vue"),
+        }
+        
+        document_extensions = {
+            ".md": ("document", "markdown"),
+            ".txt": ("document", "text"),
+            ".json": ("data", "json"),
+            ".yml": ("data", "yaml"),
+            ".yaml": ("data", "yaml"),
+        }
+        
+        if ext in code_extensions:
+            return code_extensions[ext]
+        elif ext in document_extensions:
+            return document_extensions[ext]
         else:
-            metadata.pop('ext', None)
-            json_str = json.dumps(metadata, separators=(',', ':'))
-            break
-    return metadata
+            return ("unknown", "unknown")
 
-def load_documents_from_folder(folder_path: str):
-    """Carrega documentos com filtros otimizados e metadados reduzidos."""
-    docs = []
-    for root, dirs, files in os.walk(folder_path):
+    def create_search_vectors(self, docs: List[Document]) -> Tuple[List[Document], List[Document]]:
+        """
+        Cria dois conjuntos de documentos para indexação:
+        1. Documentos completos para busca de contexto completo
+        2. Chunks para busca semântica mais granular
+        
+        Adiciona também vetores especiais para estruturas de código importantes.
+        """
+        full_docs = []  # Documentos completos
+        chunked_docs = []  # Chunks de documentos para busca semântica
+        
+        logger.info("Processando documentos para indexação...")
+        
+        for doc in tqdm(docs, desc="Criando vetores de busca"):
+            ext = doc.metadata.get("ext", "").lower()
+            content = doc.page_content
+            
+            # 1. Adiciona documento completo à lista de documentos completos
+            full_docs.append(doc)
+            
+            # 2. Cria chunks para busca semântica mais granular
+            chunks = self.text_splitter.split_text(content)
+            source = doc.metadata.get("source", "unknown")
+            
+            for i, chunk in enumerate(chunks):
+                chunk_metadata = {
+                    **doc.metadata,
+                    "chunk_id": i,
+                    "is_chunk": True,
+                    "chunk_size": len(chunk),
+                    "entity_type": "text_chunk",
+                }
+                
+                chunked_docs.append(Document(page_content=chunk, metadata=chunk_metadata))
+            
+            # 3. Para arquivos de código, identifica e adiciona estruturas importantes
+            if doc.metadata.get("file_type") == "code":
+                self._extract_code_structures(doc, chunked_docs)
+            
+            # 4. Para arquivos markdown, extrai seções baseadas em cabeçalhos
+            elif ext == "md":
+                self._extract_markdown_sections(doc, chunked_docs)
+        
+        self.stats["total_docs"] = len(full_docs)
+        self.stats["total_chunks"] = len(chunked_docs)
+        
+        logger.info(f"Total de documentos completos: {len(full_docs)}")
+        logger.info(f"Total de chunks e estruturas extraídas: {len(chunked_docs)}")
+        
+        return full_docs, chunked_docs
 
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
-        for file in files:
-            ext = os.path.splitext(file)[1].lower()
-            if ext not in ALLOWED_EXTS:
-                continue
-            full_path = os.path.join(root, file)
-            try:
+    def _extract_code_structures(self, doc: Document, result_docs: List[Document]) -> None:
+        """
+        Extrai estruturas importantes de código (classes, funções, etc.) e adiciona
+        à lista de documentos para indexação.
+        """
+        ext = doc.metadata.get("ext", "").lower()
+        language = doc.metadata.get("language", "").lower()
+        content = doc.page_content
+        
+        # Extração específica por linguagem
+        if language == "python":
+            # Extrai classes e funções de Python
+            class_pattern = r"class\s+(\w+)[\s\S]*?(?=\nclass|\Z)"
+            func_pattern = r"def\s+(\w+)[\s\S]*?(?=\ndef|\nclass|\Z)"
+            
+            self._extract_pattern_matches(
+                doc, content, class_pattern, "class", 100, result_docs
+            )
+            self._extract_pattern_matches(
+                doc, content, func_pattern, "function", 50, result_docs
+            )
+            
+        elif language in ["javascript", "typescript", "react", "react-typescript"]:
+            # Extrai padrões de JS/TS (funções, classes, componentes)
+            func_patterns = [
+                r"function\s+(\w+)[\s\S]*?(?=\n\s*function|\n\s*class|\Z)",
+                r"const\s+(\w+)\s*=\s*\([^)]*\)\s*=>[\s\S]*?(?=\n\s*const|\n\s*function|\n\s*class|\Z)",
+                r"class\s+(\w+)[\s\S]*?(?=\n\s*class|\Z)",
+                r"export\s+(?:default\s+)?(?:const|function|class)\s+(\w+)[\s\S]*?(?=\n\s*export|\Z)",
+            ]
+            
+            for pattern in func_patterns:
+                self._extract_pattern_matches(
+                    doc, content, pattern, "code_structure", 50, result_docs
+                )
 
-                if os.path.getsize(full_path) > MAX_FILE_SIZE:
-                    logging.debug(f"Arquivo grande ignorado: {full_path}")
-                    continue
+    def _extract_pattern_matches(
+        self, 
+        doc: Document, 
+        content: str, 
+        pattern: str, 
+        entity_type: str, 
+        min_length: int, 
+        result_docs: List[Document]
+    ) -> None:
+        """
+        Extrai padrões do conteúdo e adiciona à lista de documentos.
+        """
+        matches = re.finditer(pattern, content)
+        for match in matches:
+            entity_name = match.group(1)
+            entity_content = match.group(0)
+            
+            if len(entity_content) >= min_length:
+                result_docs.append(
+                    Document(
+                        page_content=entity_content,
+                        metadata={
+                            **doc.metadata,
+                            "entity_type": entity_type,
+                            "entity_name": entity_name,
+                            "is_chunk": False,
+                            "is_code_structure": True,
+                        },
+                    )
+                )
 
-                with open(full_path, 'rb') as f:
-                    raw_data = f.read()
-                result = chardet.detect(raw_data)
-                encoding = result.get("encoding") or 'utf-8'
+    def _extract_markdown_sections(self, doc: Document, result_docs: List[Document]) -> None:
+        """
+        Extrai seções de documentos markdown baseadas em cabeçalhos.
+        """
+        content = doc.page_content
+        header_pattern = r"(#+)\s+(.*)"
+        lines = content.split("\n")
+        current_section = []
+        current_header = "Início do documento"
+        
+        for line in lines:
+            header_match = re.match(header_pattern, line)
+            if header_match:
+                # Salva a seção anterior antes de começar uma nova
+                if current_section:
+                    section_content = "\n".join(current_section)
+                    if len(section_content) > 100:
+                        result_docs.append(
+                            Document(
+                                page_content=section_content,
+                                metadata={
+                                    **doc.metadata,
+                                    "entity_type": "markdown_section",
+                                    "entity_name": current_header,
+                                    "is_chunk": False,
+                                    "is_markdown_section": True,
+                                },
+                            )
+                        )
+                
+                # Inicia nova seção
+                current_header = header_match.group(2)
+                current_section = [line]
+            else:
+                current_section.append(line)
+        
+        # Adiciona a última seção
+        if current_section:
+            section_content = "\n".join(current_section)
+            if len(section_content) > 100:
+                result_docs.append(
+                    Document(
+                        page_content=section_content,
+                        metadata={
+                            **doc.metadata,
+                            "entity_type": "markdown_section",
+                            "entity_name": current_header,
+                            "is_chunk": False,
+                            "is_markdown_section": True,
+                        },
+                    )
+                )
 
+    def index_documents(self, full_docs: List[Document], chunked_docs: List[Document]) -> Chroma:
+        """
+        Indexa os documentos no ChromaDB.
+        Usa duas coleções: uma para documentos completos e outra para chunks.
+        """
+        # Prepara diretório para ChromaDB
+        os.makedirs(self.persist_dir, exist_ok=True)
+        
+        # Limpa base existente se houver
+        if os.path.exists(self.persist_dir) and os.listdir(self.persist_dir):
+            logger.info(f"Diretório ChromaDB já existe, recriando...")
+            import shutil
+            shutil.rmtree(self.persist_dir)
+            os.makedirs(self.persist_dir, exist_ok=True)
+        
+        # Mostra um exemplo para diagnóstico
+        if full_docs:
+            logger.info(f"Exemplo de documento indexado: {full_docs[0].metadata}")
+            logger.info(f"Conteúdo de exemplo (200 caracteres): {full_docs[0].page_content[:200]}")
+        
+        # Combina os documentos para indexação única
+        all_docs = full_docs + chunked_docs
+        logger.info(f"Indexando total de {len(all_docs)} documentos...")
+        
+        # Processa em lotes para evitar problemas de memória
+        batch_size = 100
+        vectorstore = None
+        
+        for i in tqdm(range(0, len(all_docs), batch_size), desc="Indexando lotes"):
+            batch = all_docs[i : i + batch_size]
+            
+            if i == 0:
+                # Cria o vectorstore na primeira iteração
+                vectorstore = Chroma.from_documents(
+                    documents=batch,
+                    embedding=self.embeddings,
+                    persist_directory=self.persist_dir,
+                    collection_name=self.collection_name
+                )
+            else:
+                # Adiciona documentos nas iterações subsequentes
+                vectorstore.add_documents(documents=batch)
+            
+            # Persiste após cada lote
+            if hasattr(vectorstore, "_persist"):
+                vectorstore._persist()
+        
+        logger.info(f"Base ChromaDB criada com sucesso em {self.persist_dir}")
+        
+        # Verifica a base criada
+        try:
+            collection = vectorstore.get()
+            count = len(collection["ids"])
+            logger.info(f"Total de documentos na base ChromaDB: {count}")
+        except Exception as e:
+            logger.error(f"Erro ao verificar a base ChromaDB: {str(e)}")
+        
+        return vectorstore
 
-                text = raw_data.decode(encoding, errors="replace").strip()
-                if len(text) < 10:
-                    continue
-
-                metadata = validate_metadata({
-                    "source": os.path.relpath(full_path, folder_path),
-                    "ext": ext[1:] if ext else ""
-                })
-
-                docs.append(Document(page_content=text, metadata=metadata))
-
-            except Exception as e:
-                logging.error(f"Erro ao carregar {full_path}: {str(e)}")
-    return docs
-
-def trim_document_for_indexing(doc: Document, snippet_length: int = 300) -> Document:
-    """
-    Cria um novo documento com metadados reduzidos para indexação no Pinecone.
-    Aqui mantemos apenas o 'source' e 'ext' e adicionamos um 'snippet' curto.
-    """
-    new_metadata = {}
-    if "source" in doc.metadata:
-        new_metadata["source"] = doc.metadata["source"]
-    if "ext" in doc.metadata:
-        new_metadata["ext"] = doc.metadata["ext"]
-
-    new_metadata["snippet"] = doc.page_content[:snippet_length]
-
-    new_metadata = validate_metadata(new_metadata)
-    return Document(page_content=doc.page_content, metadata=new_metadata)
 
 def main(folder_path: str):
-    logging.info("Iniciando carregamento dos documentos...")
-    docs = load_documents_from_folder(folder_path)
-    logging.info(f"Documentos carregados: {len(docs)}")
+    # Inicializa o indexador
+    indexer = CodeIndexer()
+    
+    # Carrega documentos
+    docs = indexer.load_documents_from_folder(folder_path)
+    if not docs:
+        logger.error("Nenhum documento encontrado para indexar. Verifique o caminho e os tipos de arquivo.")
+        exit(1)
+    
+    # Cria vetores de busca
+    full_docs, chunked_docs = indexer.create_search_vectors(docs)
+    
+    # Indexa documentos no ChromaDB
+    vectorstore = indexer.index_documents(full_docs, chunked_docs)
+    
+    # Estatísticas finais
+    logger.info("=== Estatísticas de Indexação ===")
+    logger.info(f"Documentos processados: {indexer.stats['loaded']}")
+    logger.info(f"Documentos completos indexados: {indexer.stats['total_docs']}")
+    logger.info(f"Chunks e estruturas extraídas: {indexer.stats['total_chunks']}")
+    logger.info(f"Total de vetores criados: {indexer.stats['total_docs'] + indexer.stats['total_chunks']}")
+    logger.info("Indexação concluída com sucesso!")
 
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDINGS_MODEL,
-        model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-        encode_kwargs={"normalize_embeddings": True}
-    )
-
-
-    pc = Pinecone(api_key=config("PINECONE_API_KEY"))
-
-
-    if INDEX_NAME in pc.list_indexes().names():
-        pc.delete_index(INDEX_NAME)
-        logging.info(f"Índice {INDEX_NAME} removido")
-        time.sleep(30)
-
-    logging.info(f"Criando novo índice {INDEX_NAME}...")
-    pc.create_index(
-        name=INDEX_NAME,
-        dimension=MODEL_DIMENSION,
-        metric="cosine",
-        spec=ServerlessSpec(
-            cloud=os.getenv("PINECONE_CLOUD", "aws"),
-            region=os.getenv("PINECONE_REGION", "us-east-1")
-        )
-    )
-    time.sleep(60)
-
-    vectorstore = PineconeVectorStore(
-        index_name=INDEX_NAME,
-        embedding=embeddings
-    )
-
-    child_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150
-    )
-
-    total_indexed = 0
-    batch_size = 100
-
-    try:
-        for i in tqdm(range(0, len(docs), batch_size), desc="Indexando lotes"):
-            batch = docs[i:i + batch_size]
-            chunks = child_splitter.split_documents(batch)
-
-            for j in range(0, len(chunks), 50):
-                sub_batch = chunks[j:j + 50]
-                sub_batch = [trim_document_for_indexing(doc) for doc in sub_batch]
-                try:
-                    vectorstore.add_documents(sub_batch)
-                    total_indexed += len(sub_batch)
-                except Exception as e:
-                    logging.error(f"Erro no sub-lote {j}-{j + 50}: {str(e)}")
-
-            logging.debug(f"Lote {i // batch_size} processado: {len(chunks)} chunks")
-
-    except KeyboardInterrupt:
-        logging.warning("Processo interrompido pelo usuário!")
-
-    logging.info(f"Total de chunks indexados: {total_indexed}")
-
-    logging.info("Configurando sistema de recuperação...")
-    store = LocalFileStore(os.path.join(PERSIST_DIR, "parent_docs"))
-    docstore = create_kv_docstore(store)
-
-    retriever = ParentDocumentRetriever(
-        vectorstore=vectorstore,
-        byte_store=docstore,
-        child_splitter=child_splitter,
-        parent_splitter=RecursiveCharacterTextSplitter(
-            chunk_size=1600,
-            chunk_overlap=300
-        ),
-        search_kwargs={"k": 5},
-        fail_on_missing_parent_document=True
-    )
-
-    logging.info("Indexação concluída com sucesso!")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Indexador de código com embeddings locais")
+    parser = argparse.ArgumentParser(
+        description="Indexador de código com embeddings locais usando ChromaDB"
+    )
     parser.add_argument("--folder", required=True, help="Pasta para indexar")
     args = parser.parse_args()
 
-    logging.info(f"Iniciando indexação de: {args.folder}")
+    logger.info(f"Iniciando indexação de: {args.folder}")
     main(args.folder)
-    logging.info("Processo finalizado!")
+    logger.info("Processo finalizado!")
