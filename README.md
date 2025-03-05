@@ -1,13 +1,15 @@
-# 🐕 Pakkun Project - Assistente de Código com RAG
+# 🐕 Pakkun Project - Assistente de Código com RAG Avançado
 
-Pakkun é um assistente inteligente de código que utiliza técnicas avançadas de RAG (Retrieval Augmented Generation) para fornecer respostas precisas sobre sua base de código. O projeto utiliza **ChromaDB** como banco de dados vetorial local e **Streamlit** para a interface interativa.
+Pakkun é um assistente inteligente de código que utiliza técnicas avançadas de RAG (Retrieval Augmented Generation) para fornecer respostas precisas sobre sua base de código. O projeto utiliza **ChromaDB** como banco de dados vetorial local com **coleções individuais por arquivo** e **Streamlit** para a interface interativa.
 
 ## 📊 Funcionalidades
 
-- **Indexação Inteligente**: Análise e indexação de códigos com extração de estruturas específicas como funções, classes e componentes
-- **Busca Semântica**: Recuperação de informações baseada em significado usando embeddings, não apenas correspondência de palavras-chave
-- **Múltiplas Estratégias de Recuperação**: Combina diferentes métodos para encontrar o conteúdo mais relevante
-- **Interface Intuitiva**: Interface de chat amigável para interagir com o assistente
+- **Indexação por Arquivo**: Cada arquivo tem sua própria coleção para buscas mais precisas e contextualizadas
+- **Parsers Específicos por Linguagem**: Processamento especializado para Python e JavaScript/TypeScript
+- **Chunking Otimizado**: Chunks maiores e com sobreposição para melhor contexto e compreensão
+- **Busca Semântica Avançada**: Múltiplas estratégias de busca com priorização inteligente
+- **Extração Estrutural**: Detecção sofisticada de classes, funções, componentes React e hooks
+- **Interface Intuitiva**: Interface de chat amigável com formatação melhorada e visualização de raciocínio
 
 ## 📋 Pré-requisitos
 
@@ -56,12 +58,14 @@ Antes de usar o assistente, é necessário indexar sua base de código:
 python core/code_indexer.py --folder <caminho_da_pasta>
 ```
 
-Este processo:
+Este processo aprimorado:
 - Lê todos os arquivos de código no diretório especificado
-- Extrai estruturas importantes como classes e funções
-- Divide os documentos em chunks para busca semântica
-- Gera embeddings usando o modelo sentence-transformers
-- Armazena tudo no banco ChromaDB local
+- Cria uma coleção ChromaDB individual para cada arquivo
+- Utiliza parsers específicos para diferentes linguagens (Python, JavaScript/TypeScript)
+- Extrai estruturas complexas como classes, métodos, decoradores, componentes React e hooks
+- Gera chunks maiores (2500 caracteres) com alta sobreposição (300 caracteres)
+- Mantém um mapeamento JSON de arquivos para coleções para consulta rápida
+- Armazena metadados ricos sobre cada documento para filtragem avançada
 
 ## 🤖 Executando o Assistente
 
@@ -78,10 +82,14 @@ Seu navegador abrirá automaticamente com a interface do Pakkun, onde você pode
 
 ## 🧠 Recursos Avançados
 
-- **Deduplicação e Reranking**: Algoritmos que priorizam e diversificam resultados
-- **Extração Inteligente**: Analisa diferentes linguagens de programação e extrai estruturas específicas
+- **MultiCollectionRAG**: Sistema que busca em coleções individuais para resultados mais precisos
+- **Detecção Aprimorada de Arquivos**: Reconhece menções a arquivos em consultas, mesmo parciais
+- **Estratégias de Busca Adaptativas**: Combina busca específica por arquivo com busca global
+- **Resposta Inteligente sobre Arquivos**: Detecta consultas sobre listagem de arquivos e fornece sumários
+- **Deduplicação e Reranking**: Algoritmos que priorizam, deduplicam e diversificam resultados
+- **Extração Estrutural por Linguagem**: Analisa código com regras específicas para cada linguagem
 - **Memória de Conversa**: Mantém o contexto da conversa para respostas mais precisas
-- **Filtros Contextuais**: Busca otimizada baseada no tipo de pergunta
+- **Visualização de Raciocínio**: Formato <think>...</think> para explicar o processo de pensamento
 
 ## 🔧 Personalização
 

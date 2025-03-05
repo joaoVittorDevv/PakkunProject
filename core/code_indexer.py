@@ -1,13 +1,15 @@
 import argparse
+import hashlib
+import json
 import logging
 import os
 import re
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any, Set
 
 import chardet
 import torch
 from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter, Language
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from tqdm import tqdm
@@ -15,9 +17,10 @@ from tqdm import tqdm
 # Configurações
 EMBEDDINGS_MODEL = "sentence-transformers/all-mpnet-base-v2"
 PERSIST_DIR = "./chroma_db"
-COLLECTION_NAME = "code_collection"
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 150
+COLLECTION_NAME_PREFIX = "file_"
+COLLECTION_MAP_NAME = "collection_map"
+CHUNK_SIZE = 2500  # Aumentando tamanho de chunk para mais contexto
+CHUNK_OVERLAP = 300  # Aumentando sobreposição para melhor contexto
 
 ALLOWED_EXTS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".md", ".json", ".yml", ".yaml", 
@@ -27,7 +30,7 @@ ALLOWED_EXTS = {
 
 EXCLUDED_DIRS = {
     "node_modules", "venv", ".venv", "__pycache__", ".git", ".idea", 
-    "env", "dist", "build", ".pytest_cache", "__snapshots__"
+    "env", "dist", "build", ".pytest_cache", "__snapshots__", "chroma_db"
 }
 
 MAX_FILE_SIZE = 100_000_000  # 100 MB
@@ -45,18 +48,19 @@ logger = logging.getLogger(__name__)
 class CodeIndexer:
     """
     Classe responsável por indexar código fonte e documentação.
-    Usa ChromaDB para armazenar embeddings de documentos completos e chunks de texto.
+    Usa ChromaDB para armazenar embeddings, com coleções separadas para cada arquivo.
     """
     def __init__(
         self,
         embeddings_model: str = EMBEDDINGS_MODEL,
         persist_dir: str = PERSIST_DIR,
-        collection_name: str = COLLECTION_NAME,
+        collection_prefix: str = COLLECTION_NAME_PREFIX,
         device: Optional[str] = None
     ):
         self.embeddings_model = embeddings_model
         self.persist_dir = persist_dir
-        self.collection_name = collection_name
+        self.collection_prefix = collection_prefix
+        self.collection_map_name = COLLECTION_MAP_NAME
         
         # Determina o device para embeddings
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -69,13 +73,8 @@ class CodeIndexer:
             encode_kwargs={"normalize_embeddings": True},
         )
         
-        # Inicializa o text splitter para chunks
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", " ", ""],
-            keep_separator=True,
-        )
+        # Inicializa os text splitters específicos por linguagem
+        self._init_text_splitters()
         
         # Contadores para estatísticas
         self.stats = {
@@ -84,16 +83,57 @@ class CodeIndexer:
             "skipped_size": 0,
             "error": 0,
             "total_chunks": 0,
-            "total_docs": 0,
+            "total_files": 0,
+            "total_collections": 0,
+        }
+        
+        # Mapeamento de arquivos para coleções
+        self.collection_map = {}
+    
+    def _init_text_splitters(self):
+        """
+        Inicializa text splitters específicos para diferentes linguagens.
+        """
+        # Splitter genérico para uso padrão
+        self.default_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " ", ""],
+            keep_separator=True,
+        )
+        
+        # Splitter específico para Python
+        self.python_splitter = RecursiveCharacterTextSplitter.from_language(
+            language=Language.PYTHON,
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            keep_separator=True,
+        )
+        
+        # Splitter específico para JavaScript/TypeScript
+        self.js_splitter = RecursiveCharacterTextSplitter.from_language(
+            language=Language.JS,
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            keep_separator=True,
+        )
+        
+        # Mapeamento de extensões para text splitters específicos
+        self.language_splitters = {
+            "python": self.python_splitter,
+            "javascript": self.js_splitter,
+            "typescript": self.js_splitter,
+            "react": self.js_splitter,
+            "react-typescript": self.js_splitter,
         }
 
-    def load_documents_from_folder(self, folder_path: str) -> List[Document]:
+    def load_documents_from_folder(self, folder_path: str) -> Dict[str, List[Document]]:
         """
         Carrega documentos de código do diretório especificado.
-        Retorna uma lista de documentos com metadados aprimorados.
+        Retorna um dicionário mapeando caminhos de arquivo para listas de documentos.
         """
         logger.info(f"Carregando documentos do diretório: {folder_path}")
-        docs = []
+        docs_by_file = {}
 
         for root, dirs, files in os.walk(folder_path):
             # Filtra diretórios excluídos
@@ -143,7 +183,8 @@ class CodeIndexer:
                         "is_chunk": False,  # Documento completo
                     }
 
-                    docs.append(Document(page_content=text, metadata=metadata))
+                    # Adiciona o documento ao dicionário
+                    docs_by_file[rel_path] = [Document(page_content=text, metadata=metadata)]
                     self.stats["loaded"] += 1
 
                 except Exception as e:
@@ -155,7 +196,7 @@ class CodeIndexer:
         logger.info(f"Arquivos muito grandes ignorados: {self.stats['skipped_size']}")
         logger.info(f"Erros encontrados: {self.stats['error']}")
         
-        return docs
+        return docs_by_file
 
     def _get_file_metadata(self, ext: str) -> Tuple[str, str]:
         """
@@ -194,30 +235,38 @@ class CodeIndexer:
         else:
             return ("unknown", "unknown")
 
-    def create_search_vectors(self, docs: List[Document]) -> Tuple[List[Document], List[Document]]:
+    def process_documents(self, docs_by_file: Dict[str, List[Document]]) -> Dict[str, List[Document]]:
         """
-        Cria dois conjuntos de documentos para indexação:
-        1. Documentos completos para busca de contexto completo
-        2. Chunks para busca semântica mais granular
+        Processa os documentos para cada arquivo:
+        1. Mantém o documento completo
+        2. Gera chunks usando o splitter apropriado para a linguagem
+        3. Extrai estruturas importantes (classes, funções, etc.)
         
-        Adiciona também vetores especiais para estruturas de código importantes.
+        Retorna um dicionário mapeando caminhos de arquivo para listas de documentos processados.
         """
-        full_docs = []  # Documentos completos
-        chunked_docs = []  # Chunks de documentos para busca semântica
+        processed_docs = {}
         
         logger.info("Processando documentos para indexação...")
         
-        for doc in tqdm(docs, desc="Criando vetores de busca"):
-            ext = doc.metadata.get("ext", "").lower()
+        for file_path, docs in tqdm(docs_by_file.items(), desc="Processando arquivos"):
+            if not docs:
+                continue
+                
+            doc = docs[0]  # Cada arquivo tem um documento principal
             content = doc.page_content
+            language = doc.metadata.get("language", "").lower()
+            file_type = doc.metadata.get("file_type", "unknown")
+            ext = doc.metadata.get("ext", "").lower()
             
-            # 1. Adiciona documento completo à lista de documentos completos
-            full_docs.append(doc)
+            # Cria a lista de documentos processados, começando com o documento completo
+            processed_file_docs = [doc]
             
-            # 2. Cria chunks para busca semântica mais granular
-            chunks = self.text_splitter.split_text(content)
-            source = doc.metadata.get("source", "unknown")
+            # Chunks para busca semântica mais granular
+            # Escolhe o splitter apropriado para a linguagem
+            splitter = self.language_splitters.get(language, self.default_splitter)
+            chunks = splitter.split_text(content)
             
+            # Adiciona chunks ao resultado
             for i, chunk in enumerate(chunks):
                 chunk_metadata = {
                     **doc.metadata,
@@ -227,23 +276,25 @@ class CodeIndexer:
                     "entity_type": "text_chunk",
                 }
                 
-                chunked_docs.append(Document(page_content=chunk, metadata=chunk_metadata))
+                processed_file_docs.append(Document(page_content=chunk, metadata=chunk_metadata))
             
-            # 3. Para arquivos de código, identifica e adiciona estruturas importantes
-            if doc.metadata.get("file_type") == "code":
-                self._extract_code_structures(doc, chunked_docs)
+            # Extrai estruturas específicas com base no tipo de arquivo
+            if file_type == "code":
+                self._extract_code_structures(doc, processed_file_docs)
             
-            # 4. Para arquivos markdown, extrai seções baseadas em cabeçalhos
+            # Para Markdown, extrai seções
             elif ext == "md":
-                self._extract_markdown_sections(doc, chunked_docs)
+                self._extract_markdown_sections(doc, processed_file_docs)
+            
+            # Adiciona os documentos processados ao resultado
+            processed_docs[file_path] = processed_file_docs
+            self.stats["total_chunks"] += len(processed_file_docs) - 1  # -1 para excluir o documento completo
         
-        self.stats["total_docs"] = len(full_docs)
-        self.stats["total_chunks"] = len(chunked_docs)
+        self.stats["total_files"] = len(processed_docs)
+        logger.info(f"Total de arquivos processados: {self.stats['total_files']}")
+        logger.info(f"Total de chunks e estruturas extraídas: {self.stats['total_chunks']}")
         
-        logger.info(f"Total de documentos completos: {len(full_docs)}")
-        logger.info(f"Total de chunks e estruturas extraídas: {len(chunked_docs)}")
-        
-        return full_docs, chunked_docs
+        return processed_docs
 
     def _extract_code_structures(self, doc: Document, result_docs: List[Document]) -> None:
         """
@@ -256,61 +307,214 @@ class CodeIndexer:
         
         # Extração específica por linguagem
         if language == "python":
-            # Extrai classes e funções de Python
-            class_pattern = r"class\s+(\w+)[\s\S]*?(?=\nclass|\Z)"
-            func_pattern = r"def\s+(\w+)[\s\S]*?(?=\ndef|\nclass|\Z)"
-            
-            self._extract_pattern_matches(
-                doc, content, class_pattern, "class", 100, result_docs
-            )
-            self._extract_pattern_matches(
-                doc, content, func_pattern, "function", 50, result_docs
-            )
+            # Extração mais complexa para Python
+            self._extract_python_structures(doc, content, result_docs)
             
         elif language in ["javascript", "typescript", "react", "react-typescript"]:
-            # Extrai padrões de JS/TS (funções, classes, componentes)
-            func_patterns = [
-                r"function\s+(\w+)[\s\S]*?(?=\n\s*function|\n\s*class|\Z)",
-                r"const\s+(\w+)\s*=\s*\([^)]*\)\s*=>[\s\S]*?(?=\n\s*const|\n\s*function|\n\s*class|\Z)",
-                r"class\s+(\w+)[\s\S]*?(?=\n\s*class|\Z)",
-                r"export\s+(?:default\s+)?(?:const|function|class)\s+(\w+)[\s\S]*?(?=\n\s*export|\Z)",
-            ]
-            
-            for pattern in func_patterns:
-                self._extract_pattern_matches(
-                    doc, content, pattern, "code_structure", 50, result_docs
-                )
+            # Extração melhorada para JS/TS
+            self._extract_js_structures(doc, content, result_docs)
 
-    def _extract_pattern_matches(
-        self, 
-        doc: Document, 
-        content: str, 
-        pattern: str, 
-        entity_type: str, 
-        min_length: int, 
-        result_docs: List[Document]
-    ) -> None:
+    def _extract_python_structures(self, doc: Document, content: str, result_docs: List[Document]) -> None:
         """
-        Extrai padrões do conteúdo e adiciona à lista de documentos.
+        Extração refinada de estruturas Python com melhor reconhecimento de contexto.
         """
-        matches = re.finditer(pattern, content)
-        for match in matches:
-            entity_name = match.group(1)
-            entity_content = match.group(0)
-            
-            if len(entity_content) >= min_length:
-                result_docs.append(
-                    Document(
-                        page_content=entity_content,
-                        metadata={
-                            **doc.metadata,
-                            "entity_type": entity_type,
-                            "entity_name": entity_name,
-                            "is_chunk": False,
-                            "is_code_structure": True,
-                        },
+        # Classes com captura de documentação e métodos
+        class_pattern = r"(class\s+\w+(?:\([^)]*\))?\s*:(?:[\s\S]*?)(?=\nclass|\Z))"
+        classes = re.finditer(class_pattern, content)
+        
+        for match in classes:
+            class_content = match.group(0)
+            # Encontra o nome da classe
+            class_name_match = re.search(r"class\s+(\w+)", class_content)
+            if class_name_match:
+                class_name = class_name_match.group(1)
+                
+                # Verifica se o tamanho é suficiente
+                if len(class_content) >= 100:
+                    result_docs.append(
+                        Document(
+                            page_content=class_content,
+                            metadata={
+                                **doc.metadata,
+                                "entity_type": "class",
+                                "entity_name": class_name,
+                                "is_chunk": False,
+                                "is_code_structure": True,
+                            },
+                        )
                     )
-                )
+        
+        # Funções e métodos
+        func_pattern = r"(def\s+\w+\([^)]*\)\s*(?:->(?:[^:]+))?\s*:(?:[\s\S]*?)(?=\ndef|\nclass|\Z))"
+        functions = re.finditer(func_pattern, content)
+        
+        for match in functions:
+            func_content = match.group(0)
+            # Encontra o nome da função
+            func_name_match = re.search(r"def\s+(\w+)", func_content)
+            if func_name_match:
+                func_name = func_name_match.group(1)
+                
+                # Tenta capturar docstring se existir
+                docstring_match = re.search(r'"""([\s\S]*?)"""', func_content)
+                has_docstring = bool(docstring_match)
+                
+                # Extrai também o contexto (indentação)
+                is_method = re.search(r'^\s+def', func_content, re.MULTILINE) is not None
+                
+                # Verifica se o tamanho é suficiente
+                if len(func_content) >= 50:
+                    result_docs.append(
+                        Document(
+                            page_content=func_content,
+                            metadata={
+                                **doc.metadata,
+                                "entity_type": "method" if is_method else "function",
+                                "entity_name": func_name,
+                                "has_docstring": has_docstring,
+                                "is_chunk": False,
+                                "is_code_structure": True,
+                            },
+                        )
+                    )
+        
+        # Extrai decoradores (@app.route, @property, etc.)
+        decorator_pattern = r"(@\w+(?:\.\w+)*(?:\([^)]*\))?\s*\n+\s*def\s+\w+(?:[\s\S]*?)(?=\n\S|\Z))"
+        decorators = re.finditer(decorator_pattern, content)
+        
+        for match in decorators:
+            decorator_content = match.group(0)
+            # Encontra o nome do decorador
+            decorator_name_match = re.search(r"@([\w\.]+)", decorator_content)
+            func_name_match = re.search(r"def\s+(\w+)", decorator_content)
+            
+            if decorator_name_match and func_name_match:
+                decorator_name = decorator_name_match.group(1)
+                func_name = func_name_match.group(1)
+                
+                # Verifica se o tamanho é suficiente
+                if len(decorator_content) >= 50:
+                    result_docs.append(
+                        Document(
+                            page_content=decorator_content,
+                            metadata={
+                                **doc.metadata,
+                                "entity_type": "decorated_function",
+                                "entity_name": func_name,
+                                "decorator": decorator_name,
+                                "is_chunk": False,
+                                "is_code_structure": True,
+                            },
+                        )
+                    )
+
+    def _extract_js_structures(self, doc: Document, content: str, result_docs: List[Document]) -> None:
+        """
+        Extração refinada de estruturas JavaScript/TypeScript.
+        """
+        # Extrai classes
+        class_pattern = r"(class\s+\w+(?:\s+extends\s+\w+)?\s*\{[\s\S]*?(?=\n\}\n|\}\Z))"
+        classes = re.finditer(class_pattern, content)
+        
+        for match in classes:
+            class_content = match.group(0) + "\n}"  # Adiciona o fechamento da classe
+            class_name_match = re.search(r"class\s+(\w+)", class_content)
+            
+            if class_name_match:
+                class_name = class_name_match.group(1)
+                
+                # Verifica se o tamanho é suficiente
+                if len(class_content) >= 100:
+                    result_docs.append(
+                        Document(
+                            page_content=class_content,
+                            metadata={
+                                **doc.metadata,
+                                "entity_type": "class",
+                                "entity_name": class_name,
+                                "is_chunk": False,
+                                "is_code_structure": True,
+                            },
+                        )
+                    )
+        
+        # Componentes React (função ou const)
+        component_patterns = [
+            # Funções de componente React
+            r"(function\s+(\w+)\s*\([^)]*\)\s*\{[\s\S]*?(?=\n\}\n|\}\Z))",
+            # Arrow functions para componentes React
+            r"(const\s+(\w+)\s*=\s*\([^)]*\)\s*=>\s*\{[\s\S]*?(?=\n\}\n|\}\Z))",
+            # Arrow functions sem chaves (JSX direto)
+            r"(const\s+(\w+)\s*=\s*\([^)]*\)\s*=>\s*\([\s\S]*?(?=\n\)\n|\)\Z))",
+            # Exportações nomeadas e default
+            r"(export\s+(?:default\s+)?(?:function|const|class)\s+\w+[\s\S]*?(?=\n\}\n|\}\Z|\)\Z))"
+        ]
+        
+        for pattern in component_patterns:
+            components = re.finditer(pattern, content)
+            for match in components:
+                component_content = match.group(1)
+                # Adiciona } de fechamento se necessário e não estiver incluído
+                if "{" in component_content and not component_content.rstrip().endswith("}"):
+                    component_content += "\n}"
+                # Adiciona ) de fechamento se necessário e não estiver incluído
+                elif "=>" in component_content and "(" in component_content and not component_content.rstrip().endswith(")"):
+                    component_content += "\n)"
+                
+                # Tenta obter o nome do componente
+                name_match = re.search(r"(?:function|const|class)\s+(\w+)", component_content)
+                if name_match:
+                    component_name = name_match.group(1)
+                    
+                    # Verifica se é um componente React (letra maiúscula ou contém JSX)
+                    is_react = (
+                        component_name[0].isupper() or 
+                        "<" in component_content or 
+                        "React" in component_content
+                    )
+                    
+                    entity_type = "react_component" if is_react else "function"
+                    
+                    # Verifica se o tamanho é suficiente
+                    if len(component_content) >= 50:
+                        result_docs.append(
+                            Document(
+                                page_content=component_content,
+                                metadata={
+                                    **doc.metadata,
+                                    "entity_type": entity_type,
+                                    "entity_name": component_name,
+                                    "is_chunk": False,
+                                    "is_code_structure": True,
+                                },
+                            )
+                        )
+        
+        # Hooks React (useState, useEffect, etc.)
+        hook_pattern = r"(const\s+\[\w+,\s*\w+\]\s*=\s*useState[\s\S]*?;)"
+        hooks = re.finditer(hook_pattern, content)
+        
+        for match in hooks:
+            hook_content = match.group(1)
+            # Tenta obter o nome do estado
+            state_match = re.search(r"const\s+\[(\w+),", hook_content)
+            if state_match:
+                state_name = state_match.group(1)
+                
+                # Verifica se o tamanho é suficiente
+                if len(hook_content) >= 20:
+                    result_docs.append(
+                        Document(
+                            page_content=hook_content,
+                            metadata={
+                                **doc.metadata,
+                                "entity_type": "react_hook",
+                                "entity_name": state_name,
+                                "is_chunk": False,
+                                "is_code_structure": True,
+                            },
+                        )
+                    )
 
     def _extract_markdown_sections(self, doc: Document, result_docs: List[Document]) -> None:
         """
@@ -321,6 +525,7 @@ class CodeIndexer:
         lines = content.split("\n")
         current_section = []
         current_header = "Início do documento"
+        current_level = 0
         
         for line in lines:
             header_match = re.match(header_pattern, line)
@@ -336,6 +541,7 @@ class CodeIndexer:
                                     **doc.metadata,
                                     "entity_type": "markdown_section",
                                     "entity_name": current_header,
+                                    "header_level": current_level,
                                     "is_chunk": False,
                                     "is_markdown_section": True,
                                 },
@@ -344,6 +550,7 @@ class CodeIndexer:
                 
                 # Inicia nova seção
                 current_header = header_match.group(2)
+                current_level = len(header_match.group(1))  # Número de # no cabeçalho
                 current_section = [line]
             else:
                 current_section.append(line)
@@ -359,16 +566,25 @@ class CodeIndexer:
                             **doc.metadata,
                             "entity_type": "markdown_section",
                             "entity_name": current_header,
+                            "header_level": current_level,
                             "is_chunk": False,
                             "is_markdown_section": True,
                         },
                     )
                 )
 
-    def index_documents(self, full_docs: List[Document], chunked_docs: List[Document]) -> Chroma:
+    def create_file_hash(self, file_path: str) -> str:
         """
-        Indexa os documentos no ChromaDB.
-        Usa duas coleções: uma para documentos completos e outra para chunks.
+        Cria um hash para o caminho do arquivo para uso como nome de coleção.
+        """
+        # Usa MD5 para criar um hash do caminho do arquivo
+        hash_obj = hashlib.md5(file_path.encode())
+        return hash_obj.hexdigest()
+
+    def index_documents(self, processed_docs: Dict[str, List[Document]]) -> Dict[str, Chroma]:
+        """
+        Indexa os documentos no ChromaDB, criando uma coleção separada para cada arquivo.
+        Também cria um mapeamento de arquivos para coleções.
         """
         # Prepara diretório para ChromaDB
         os.makedirs(self.persist_dir, exist_ok=True)
@@ -380,49 +596,69 @@ class CodeIndexer:
             shutil.rmtree(self.persist_dir)
             os.makedirs(self.persist_dir, exist_ok=True)
         
-        # Mostra um exemplo para diagnóstico
-        if full_docs:
-            logger.info(f"Exemplo de documento indexado: {full_docs[0].metadata}")
-            logger.info(f"Conteúdo de exemplo (200 caracteres): {full_docs[0].page_content[:200]}")
+        # Dicionário para armazenar os vectorstores criados
+        vectorstores = {}
+        collection_map = {}
         
-        # Combina os documentos para indexação única
-        all_docs = full_docs + chunked_docs
-        logger.info(f"Indexando total de {len(all_docs)} documentos...")
-        
-        # Processa em lotes para evitar problemas de memória
-        batch_size = 100
-        vectorstore = None
-        
-        for i in tqdm(range(0, len(all_docs), batch_size), desc="Indexando lotes"):
-            batch = all_docs[i : i + batch_size]
+        # Cria uma coleção para cada arquivo
+        for file_path, docs in tqdm(processed_docs.items(), desc="Indexando arquivos"):
+            if not docs:
+                continue
             
-            if i == 0:
-                # Cria o vectorstore na primeira iteração
-                vectorstore = Chroma.from_documents(
-                    documents=batch,
-                    embedding=self.embeddings,
-                    persist_directory=self.persist_dir,
-                    collection_name=self.collection_name
-                )
-            else:
-                # Adiciona documentos nas iterações subsequentes
-                vectorstore.add_documents(documents=batch)
+            # Cria um hash para o caminho do arquivo para uso como nome de coleção
+            file_hash = self.create_file_hash(file_path)
+            collection_name = f"{self.collection_prefix}{file_hash}"
             
-            # Persiste após cada lote
-            if hasattr(vectorstore, "_persist"):
-                vectorstore._persist()
+            # Adiciona ao mapeamento
+            collection_map[file_path] = {
+                "collection_name": collection_name,
+                "file_hash": file_hash,
+                "language": docs[0].metadata.get("language", "unknown"),
+                "file_type": docs[0].metadata.get("file_type", "unknown"),
+                "num_chunks": len(docs) - 1  # -1 para excluir o documento completo
+            }
+            
+            # Cria vectorstore para este arquivo
+            vectorstore = Chroma.from_documents(
+                documents=docs,
+                embedding=self.embeddings,
+                persist_directory=self.persist_dir,
+                collection_name=collection_name
+            )
+            
+            # Armazena no dicionário
+            vectorstores[file_path] = vectorstore
         
-        logger.info(f"Base ChromaDB criada com sucesso em {self.persist_dir}")
+        # Salva o mapeamento em um arquivo para referência futura
+        self.collection_map = collection_map
+        self._save_collection_map()
         
-        # Verifica a base criada
+        self.stats["total_collections"] = len(vectorstores)
+        logger.info(f"Total de coleções ChromaDB criadas: {self.stats['total_collections']}")
+        
+        return vectorstores
+    
+    def _save_collection_map(self) -> None:
+        """
+        Salva o mapeamento de arquivos para coleções em um arquivo JSON.
+        """
+        if not self.collection_map:
+            return
+        
+        map_path = os.path.join(self.persist_dir, f"{self.collection_map_name}.json")
         try:
-            collection = vectorstore.get()
-            count = len(collection["ids"])
-            logger.info(f"Total de documentos na base ChromaDB: {count}")
+            with open(map_path, 'w') as f:
+                json.dump({
+                    "files": self.collection_map,
+                    "stats": self.stats,
+                    "created_at": {
+                        "timestamp": time.time(),
+                        "human_readable": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                }, f, indent=2)
+            logger.info(f"Mapeamento de coleções salvo em {map_path}")
         except Exception as e:
-            logger.error(f"Erro ao verificar a base ChromaDB: {str(e)}")
-        
-        return vectorstore
+            logger.error(f"Erro ao salvar mapeamento de coleções: {e}")
 
 
 def main(folder_path: str):
@@ -430,33 +666,36 @@ def main(folder_path: str):
     indexer = CodeIndexer()
     
     # Carrega documentos
-    docs = indexer.load_documents_from_folder(folder_path)
-    if not docs:
+    docs_by_file = indexer.load_documents_from_folder(folder_path)
+    if not docs_by_file:
         logger.error("Nenhum documento encontrado para indexar. Verifique o caminho e os tipos de arquivo.")
         exit(1)
     
-    # Cria vetores de busca
-    full_docs, chunked_docs = indexer.create_search_vectors(docs)
+    # Processa documentos
+    processed_docs = indexer.process_documents(docs_by_file)
     
     # Indexa documentos no ChromaDB
-    vectorstore = indexer.index_documents(full_docs, chunked_docs)
+    vectorstores = indexer.index_documents(processed_docs)
     
     # Estatísticas finais
     logger.info("=== Estatísticas de Indexação ===")
-    logger.info(f"Documentos processados: {indexer.stats['loaded']}")
-    logger.info(f"Documentos completos indexados: {indexer.stats['total_docs']}")
-    logger.info(f"Chunks e estruturas extraídas: {indexer.stats['total_chunks']}")
-    logger.info(f"Total de vetores criados: {indexer.stats['total_docs'] + indexer.stats['total_chunks']}")
+    logger.info(f"Arquivos processados: {indexer.stats['loaded']}")
+    logger.info(f"Total de arquivos indexados: {indexer.stats['total_files']}")
+    logger.info(f"Total de chunks e estruturas extraídas: {indexer.stats['total_chunks']}")
+    logger.info(f"Total de coleções ChromaDB: {indexer.stats['total_collections']}")
     logger.info("Indexação concluída com sucesso!")
 
 
 if __name__ == "__main__":
+    import time
     parser = argparse.ArgumentParser(
-        description="Indexador de código com embeddings locais usando ChromaDB"
+        description="Indexador de código avançado com embeddings locais usando ChromaDB"
     )
     parser.add_argument("--folder", required=True, help="Pasta para indexar")
     args = parser.parse_args()
 
     logger.info(f"Iniciando indexação de: {args.folder}")
+    start_time = time.time()
     main(args.folder)
-    logger.info("Processo finalizado!")
+    elapsed = time.time() - start_time
+    logger.info(f"Processo finalizado em {elapsed:.2f} segundos!")
