@@ -1,17 +1,22 @@
 import streamlit as st
 import os
 import torch
-import time
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain.chains import create_retrieval_chain
+from langchain.retrievers.self_query.base import SelfQueryRetriever
+from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.chains.query_constructor.schema import AttributeInfo
+from langchain_experimental.utilities import PythonREPL
+from langchain_core.tools import Tool
+
 
 load_dotenv()
 
+# Configurações
 EMBEDDINGS_MODEL = "sentence-transformers/all-mpnet-base-v2"
 PERSIST_DIR = "./chroma_db"
 COLLECTION_NAME = "code_collection"
@@ -32,24 +37,60 @@ chroma = Chroma(
 
 llm = ChatGroq(model_name=LLM_MODEL)
 
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True,
-    output_key="answer",
+# Define os AttributeInfo baseados nos metadados dos seus documentos
+metadata_field_info = [
+    AttributeInfo(
+        name="genre",
+        description="The genre of the movie. One of ['science fiction', 'comedy', 'drama', 'thriller', 'romance', 'action', 'animated']",
+        type="string",
+    ),
+    AttributeInfo(
+        name="year",
+        description="The year the movie was released",
+        type="integer",
+    ),
+    AttributeInfo(
+        name="director",
+        description="The name of the movie director",
+        type="string",
+    ),
+    AttributeInfo(
+        name="rating", description="A 1-10 rating for the movie", type="float"
+    ),
+]
+
+
+document_content_description = "All codes from Django/React app"
+
+retriever = SelfQueryRetriever.from_llm(
+    llm,
+    chroma,
+    document_content_description,
+    metadata_field_info,
+    verbose=True,
 )
 
-retriever = chroma.as_retriever(
-    search_type="mmr", search_kwargs={"k": 5, "fetch_k": 10}
+# Cria um template de prompt para a resposta
+system_prompt = (
+    "Use o contexto fornecido para responder à pergunta. "
+    "Se não souber, diga que não sabe. "
+    "Responda de forma completa e informativa. "
+    "Contexto: {context}"
+)
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", system_prompt),
+        ("human", "{input}"),
+    ]
 )
 
-qa_chain = ConversationalRetrievalChain.from_llm(
-    llm=llm,
-    retriever=retriever,
-    memory=memory,
-    return_source_documents=True,
-    output_key="answer",
-)
+# Cria a chain que combina os documentos recuperados
+question_answer_chain = create_stuff_documents_chain(llm, prompt)
 
+# Cria a retrieval chain usando o retriever (self-querying) e a chain de QA
+qa_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+# Configuração do Streamlit
 st.set_page_config(
     page_title="Pakkun - Assistente de Código",
     page_icon="🐕",
@@ -58,24 +99,51 @@ st.set_page_config(
 )
 
 
-def display_message(text: str):
-    if "<think>" in text and "</think>" in text:
-        start = text.find("<think>")
-        end = text.find("</think>")
-        prefix = text[:start].strip()
-        think_content = text[start + len("<think>") : end].strip()
-        suffix = text[end + len("</think>") :].strip()
+def display_message(msg):
 
-        if prefix:
-            st.markdown(prefix)
-        with st.expander("Detalhes", icon="🧠"):
-            st.info(think_content)
-        if suffix:
-            st.markdown(suffix)
-    else:
-        st.markdown(text)
+    if isinstance(msg, dict):
+        answer = msg.get("answer", "")
+
+        if "<think>" in answer and "</think>" in answer:
+            start = answer.find("<think>")
+            end = answer.find("</think>")
+            prefix = answer[:start].strip()
+            think_content = answer[start + len("<think>") : end].strip()
+            suffix = answer[end + len("</think>") :].strip()
+            if prefix:
+                st.markdown(prefix)
+            with st.expander("Detalhes", icon="🧠"):
+                st.info(think_content)
+            if suffix:
+                st.markdown(suffix)
+        else:
+            st.markdown(answer)
+
+        # Se existir contexto, exibe as fontes (por exemplo, o campo "source" de cada Document)
+        context_docs = msg.get("context", [])
+        if context_docs:
+            st.markdown("📄 Fontes")
+            for doc in context_docs:
+                source = doc.metadata.get("source", "Desconhecido")
+                st.success("- " + source)
+    elif isinstance(msg, str):
+        if "<think>" in msg and "</think>" in msg:
+            start = msg.find("<think>")
+            end = msg.find("</think>")
+            prefix = msg[:start].strip()
+            think_content = msg[start + len("<think>") : end].strip()
+            suffix = msg[end + len("</think>") :].strip()
+            if prefix:
+                st.markdown(prefix)
+            with st.expander("Detalhes", icon="🧠"):
+                st.info(think_content)
+            if suffix:
+                st.markdown(suffix)
+        else:
+            st.markdown(msg)
 
 
+# Sidebar com instruções e exemplos
 with st.sidebar:
     st.title("🐕 Pakkun")
     st.subheader("Assistente de Código Inteligente")
@@ -100,51 +168,41 @@ with st.sidebar:
 
 st.header("🐕 Pakkun - Assistente de Código")
 
+# Inicializa o histórico de conversa
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
     welcome_message = (
         "Oi! Eu sou o Pakkun, seu assistente de código. Como posso ajudar você hoje? "
-        "Faça perguntas sobre o código indexado e eu farei o meu melhor para responder!"
+        "Faça perguntas sobre o código indexado e vamos juntos melhorar e corrigir seu código!"
     )
-    st.session_state["chat_history"].append(AIMessage(content=welcome_message))
+    st.session_state["chat_history"].append(
+        {"role": "assistant", "content": welcome_message}
+    )
 
 chat_container = st.container()
-
 user_input = st.chat_input("Digite sua pergunta sobre o código:")
 
 
 def render_chat():
-    chat_placeholder = st.container()
-    for idx, message in enumerate(st.session_state["chat_history"]):
-        if isinstance(message, HumanMessage):
+    for message in st.session_state["chat_history"]:
+        if message["role"] == "user":
             with st.chat_message("user"):
-                display_message(message.content)
-        elif isinstance(message, AIMessage):
+                display_message(message["content"])
+        elif message["role"] == "assistant":
             with st.chat_message("assistant"):
-                display_message(message.content)
-                if (
-                    "current_sources" in st.session_state
-                    and idx in st.session_state["current_sources"]
-                ):
-                    st.markdown("📄 Fontes")
-                    for doc in st.session_state["current_sources"][idx]:
-                        st.success("- " + doc.metadata.get("source", "Desconhecido"))
+                display_message(message["content"])
 
 
 if user_input:
-
-    st.session_state["chat_history"].append(HumanMessage(content=user_input))
+    st.session_state["chat_history"].append({"role": "user", "content": user_input})
     render_chat()
 
     with st.spinner("Pakkun está pensando..."):
-        result = qa_chain.invoke({"question": user_input})
-        response = result["answer"]
-        sources = result.get("source_documents", [])
-        st.session_state["chat_history"].append(AIMessage(content=response))
-        if "current_sources" not in st.session_state:
-            st.session_state["current_sources"] = {}
-        st.session_state["current_sources"][
-            len(st.session_state["chat_history"]) - 1
-        ] = sources
+        result = qa_chain.invoke({"input": user_input})
+        # O resultado pode vir com a chave "output" ou direto
+        response = result.get("output", result)
+        st.session_state["chat_history"].append(
+            {"role": "assistant", "content": response}
+        )
 
     render_chat()
