@@ -84,7 +84,7 @@ class CodeIndexer:
         )
 
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=2500, chunk_overlap=300
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
 
         self.stats = {"loaded": 0, "skipped_ext": 0, "skipped_size": 0, "error": 0}
